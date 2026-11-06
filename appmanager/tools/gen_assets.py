@@ -61,6 +61,9 @@ SHIM = r"""
         (body.page == null ? -1 : body.page) + '|' +
         (body.found || '') + '|' + (body.nf || ''));
     else if (url.indexOf('/api/buildindex') === 0) p = call('buildindex', '');
+    else if (url.indexOf('/api/engine') === 0) p = call('engine', '');
+    else if (url.indexOf('/api/setengine') === 0) p = call('setengine', String(body.mode || ''));
+    else if (url.indexOf('/api/openaccess') === 0) p = call('openaccess', '');
     // 🔴 aotsync 必须排在 aot 前面：'/api/aotsync'.indexOf('/api/aot') === 0，
     // 顺序反了会被当成 aot 接口（编译），拿到的是 ok/aot/skipped/status/msg
     else if (url.indexOf('/api/aotsync') === 0) p = call('aotsync', '');

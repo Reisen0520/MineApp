@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Mine App</string>
+    <string name="access_label">应用查找</string>
+    <string name="access_desc">仅在「应用查找 / 定位」时读取桌面图标的位置，并模拟长按。不读取其他应用的内容，不做按键记录。</string>
 </resources>

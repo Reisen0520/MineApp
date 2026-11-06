@@ -31,6 +31,51 @@ public class Bridge {
      * 普通请求立刻就能执行（传输层另有一条连接，见 AdbService.shLong）。
      */
     private final ExecutorService heavy = Executors.newSingleThreadExecutor();
+
+    // ---------- 窗口引擎 ----------
+    //
+    // 查找/定位原先在 Bridge 里直接拼 shell 命令，现在统一走 WindowEngine：
+    //   access = 内置无障碍服务（快，不需要调试通道）
+    //   dump   = uiautomator dump（兼容，永远可用）
+    // 每次定位/建索引开始时按用户设置挑一次，中途不换引擎（换了会出现
+    // 「读的是旧树、点的是新位置」）。
+
+    private static final String ENGINE_PREF = "loc_engine";
+    /** 本次定位/建索引用哪个引擎；null 表示走兼容 dump */
+    private WindowEngine locEngine;
+    private WindowEngine fallbackEngine;
+
+    private android.content.SharedPreferences prefs() {
+        return web.getContext().getSharedPreferences("app", 0);
+    }
+
+    /** auto / access / dump */
+    private String enginePref() {
+        String v = prefs().getString(ENGINE_PREF, "auto");
+        return ("access".equals(v) || "dump".equals(v) || "root".equals(v)) ? v : "auto";
+    }
+
+    /**
+     * 按设置挑引擎。
+     *
+     * 显式选了「无障碍」但服务没开时返回 null —— 由调用方明确提示去开启，
+     * 不能静默降级成 dump，否则用户会以为设置没生效。
+     */
+    private WindowEngine pickEngine() {
+        String pref = enginePref();
+        if ("access".equals(pref)) return AccessEngine.ready() ? AccessEngine.get() : null;
+        if ("dump".equals(pref)) return new DumpEngine(service);
+        // root 模式：索引走桌面库，但「长按哪个坐标」仍然要读一次窗口
+        return AccessEngine.ready() ? AccessEngine.get() : new DumpEngine(service);
+    }
+
+    /** 定位/索引流程内使用的引擎；流程外默认兼容引擎 */
+    private WindowEngine win() {
+        if (locEngine != null) return locEngine;
+        if (fallbackEngine == null) fallbackEngine = new DumpEngine(service);
+        return fallbackEngine;
+    }
+
     /**
      * 定位专用线程池。
      *
@@ -418,6 +463,16 @@ public class Bridge {
      *
      * 代价：dump 一次约 2.3 秒（JVM 启动 1.5~2s + 等 UI idle 0.5s），与扫描量无关。
      */
+    /** 数一下这棵 dump 里有几个带 content-desc 的节点（桌面图标/文件夹都算） */
+    private static int countDescs(String xml) {
+        if (xml == null || xml.isEmpty()) return 0;
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("content-desc=\"[^\"]+\"").matcher(xml);
+        int n = 0;
+        while (m.find() && n < 1000) n++;
+        return n;
+    }
+
     /** 从 dump 出来的 XML 里取某个属性值 */
     private static String nodeAttr(String tag, String name) {
         java.util.regex.Matcher m = java.util.regex.Pattern
@@ -499,12 +554,26 @@ public class Bridge {
     private static boolean isFolderNode(String tag, String desc) {
         if (desc == null || desc.isEmpty()) return false;
         if (!"true".equals(nodeAttr(tag, "clickable"))) return false;
-        String cls = nodeAttr(tag, "class");
-        if (cls != null && cls.endsWith("RelativeLayout")) return true;
         String low = desc.toLowerCase();
-        if (low.startsWith("folder:")) return true;
-        if (desc.contains("文件夹") || desc.contains("个应用")) return true;
-        return false;
+        // 🔴 名字里明确写了文件夹的，**不管多大**都算：ColorOS 的 3×3 / 3×1 / 1×3 大文件夹
+        //    bounds 有 480×540，比普通图标大，按尺寸过滤会把它整类漏掉。
+        if (low.startsWith("folder:") || desc.contains("文件夹") || desc.contains("个应用")) {
+            return true;
+        }
+        // 剩下只能靠 class 判断（MIUI 的 RelativeLayout），这时必须限制尺寸，
+        // 否则 1200×268 的时钟插件也会被当成文件夹点开（实测直接打开了时钟）。
+        String bd = nodeAttr(tag, "bounds");
+        if (bd != null) {
+            java.util.regex.Matcher bm = java.util.regex.Pattern
+                    .compile("\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]").matcher(bd);
+            if (bm.find()) {
+                int w = Integer.parseInt(bm.group(3)) - Integer.parseInt(bm.group(1));
+                int h = Integer.parseInt(bm.group(4)) - Integer.parseInt(bm.group(2));
+                if (w > 400 || h > 400) return false;
+            }
+        }
+        String cls = nodeAttr(tag, "class");
+        return cls != null && cls.endsWith("RelativeLayout");
     }
 
     private static java.util.List<int[]> findFolders(String xml) {
@@ -551,7 +620,7 @@ public class Bridge {
             if (!b.find()) continue;
             int x1 = Integer.parseInt(b.group(1)), y1 = Integer.parseInt(b.group(2));
             int x2 = Integer.parseInt(b.group(3)), y2 = Integer.parseInt(b.group(4));
-            out.add(new Object[]{(x1 + x2) / 2, (y1 + y2) / 2, desc});
+            out.add(new Object[]{(x1 + x2) / 2, (y1 + y2) / 2, desc, x1, y1, x2, y2});
         }
         return out;
     }
@@ -577,9 +646,70 @@ public class Bridge {
         return false;
     }
 
+    /**
+     * 点开一个文件夹。
+     *
+     * 🔴 ColorOS 的大文件夹是 3×3 / 3×1 / 1×3 这几种，点中心只会打开里面第一个应用，
+     *    必须点**右下角的展开箭头**才会进入文件夹视图。
+     *    优先在 dump 里找那个小箭头节点；找不到再按右下角坐标兜底。
+     *    普通文件夹（≤400px）仍然点中心。
+     */
+    private void tapFolder(Object[] f, String pageXml) {
+        try {
+            int cx = (Integer) f[0], cy = (Integer) f[1];
+            int x1 = (Integer) f[3], y1 = (Integer) f[4];
+            int x2 = (Integer) f[5], y2 = (Integer) f[6];
+            if (x2 - x1 > 400 || y2 - y1 > 400) {
+                int[] arrow = findExpandArrow(pageXml, x1, y1, x2, y2);
+                if (arrow != null) {
+                    dbg("点大文件夹的展开箭头 " + arrow[0] + "," + arrow[1]);
+                    win().tap(arrow[0], arrow[1]);
+                } else {
+                    dbg("大文件夹，点右下角展开");
+                    win().tap(x2 - 36, y2 - 36);
+                }
+            } else {
+                win().tap(cx, cy);
+            }
+        } catch (Throwable e) {
+            win().tap((Integer) f[0], (Integer) f[1]);
+        }
+    }
+
+    /**
+     * 在文件夹范围内找「展开箭头」：一个小尺寸、可点击、位置偏右下的节点。
+     * 应用图标约 240×268，不会被选中；箭头一般几十像素见方。
+     */
+    private static int[] findExpandArrow(String xml, int x1, int y1, int x2, int y2) {
+        if (xml == null || xml.isEmpty()) return null;
+        int[] best = null;
+        int bestScore = -1;
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("<node\\b[^>]*>").matcher(xml);
+        while (m.find()) {
+            String tag = m.group();
+            if (!"true".equals(nodeAttr(tag, "clickable"))) continue;
+            String bd = nodeAttr(tag, "bounds");
+            if (bd == null) continue;
+            java.util.regex.Matcher b = java.util.regex.Pattern
+                    .compile("\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]").matcher(bd);
+            if (!b.find()) continue;
+            int nx1 = Integer.parseInt(b.group(1)), ny1 = Integer.parseInt(b.group(2));
+            int nx2 = Integer.parseInt(b.group(3)), ny2 = Integer.parseInt(b.group(4));
+            if (nx1 < x1 || ny1 < y1 || nx2 > x2 || ny2 > y2) continue;
+            int w = nx2 - nx1, h = ny2 - ny1;
+            if (w < 20 || h < 20 || w > 120 || h > 120) continue;
+            int cx = (nx1 + nx2) / 2, cy = (ny1 + ny2) / 2;
+            if (cx < x1 + (x2 - x1) / 2 && cy < y1 + (y2 - y1) / 2) continue;
+            int score = (cx - x1) + (cy - y1);
+            if (score > bestScore) { bestScore = score; best = new int[]{cx, cy}; }
+        }
+        return best;
+    }
+
     /** 长按坐标：必须带 2~4px 位移，零距离会被当成点击直接打开应用 */
     private void longPress(int x, int y) {
-        service.shellLong("input swipe " + x + " " + y + " " + (x + 4) + " " + y + " 1500");
+        win().longPress(x, y, 1500);
     }
 
     /**
@@ -724,7 +854,7 @@ public class Bridge {
         int idx = 2 + (page - 1) * 2;
         if (idx + 1 < pager.length) {
             // 有圆点：直接点
-            service.shellLong("input tap " + pager[idx] + " " + pager[idx + 1]);
+            win().tap(pager[idx], pager[idx + 1]);
             try { Thread.sleep(400); } catch (InterruptedException ignored) { }
             return true;
         }
@@ -742,7 +872,7 @@ public class Bridge {
             //    那样 diff 会一次比一次大，滑动次数累加，表现是「在最后一页疯狂右滑、
             //    反复遍历同一页」（2026-10-29 实测被投诉）。先 HOME 回默认页再算。
             dbg("页号解析失败，先回默认页再跳");
-            service.shellLong("input keyevent 3");
+            win().key(3);
             try { Thread.sleep(400); } catch (InterruptedException ignored) { }
             cur = 1;
         }
@@ -760,7 +890,7 @@ public class Bridge {
                 dbg("跳页被打断（用户操作），停止滑动");
                 return false;
             }
-            service.shellLong("input swipe " + fx + " 1200 " + tx + " 1200 260");
+            win().swipe(fx, 1200, tx, 1200, 260);
             try { Thread.sleep(320); } catch (InterruptedException ignored) { }
         }
         // 🔴 滑完必须验证真的到了目标页：没到就**逐页修正**，不要放弃也不要继续瞎滑。
@@ -780,7 +910,7 @@ public class Bridge {
                         dbg("逐页修正被打断（用户操作）");
                         return false;
                     }
-                    service.shellLong("input swipe " + ffx + " 1200 " + ftx + " 1200 260");
+                    win().swipe(ffx, 1200, ftx, 1200, 260);
                     try { Thread.sleep(320); } catch (InterruptedException ignored) { }
                 }
                 if (interrupted()) return false;
@@ -807,9 +937,12 @@ public class Bridge {
      */
     private int probeSweep() {
         final int MAX = 10;             // 超过 10 页就不再往下数，够用了
-        service.shellLong("input keyevent 3");
+        win().key(3);
         try { Thread.sleep(700); } catch (InterruptedException ignored) { }
-        String prev = pageSignature(dumpHome(false));
+        // 🔴 HOME 之后桌面树不是立刻就绪：ColorOS 实测要 2~4 秒才把图标节点
+        //    填进无障碍树。以前第一把拿不到就直接放弃，现在最多等 4 秒。
+        // 首页至少要 5 个图标节点才算「桌面渲染完成」——空壳通常只有 1~2 个
+        String prev = pageSignature(dumpStable(5, 6000));
         if (prev.isEmpty()) {
             dbg("滑动探测：桌面 dump 为空，放弃");
             return 0;
@@ -824,8 +957,7 @@ public class Bridge {
         // ① 一路右滑，直到内容不再变化（= 已经在最左一页）
         for (int i = 0; i < MAX; i++) {
             if (interrupted()) return 0;
-            swipePage(false);
-            String cur = pageSignature(dumpHome(false));
+            String cur = swipePageSig(false, prev);
             if (cur.isEmpty()) return 0;
             if (cur.equals(prev)) break;              // 滑不动了
             if (!sharesDock(cur, base)) {             // 进了负一屏 → 退回来收工
@@ -842,9 +974,9 @@ public class Bridge {
         int total = 1;
         for (int i = 0; i < MAX; i++) {
             if (interrupted()) return 0;
-            swipePage(true);
-            String cur = pageSignature(dumpHome(false));
+            String cur = swipePageSig(true, prev);
             if (cur.isEmpty()) break;
+            prev = cur;
             if (!seen.add(cur)) break;                // 绕回已见过的页 = 到头
             if (!sharesDock(cur, base)) {             // 负一屏 / 别家界面
                 dbg("滑动探测：左侧遇到非桌面页面，停止");
@@ -861,6 +993,67 @@ public class Bridge {
         }
         dbg("滑动探测：共 " + total + " 页");
         return total;
+    }
+
+    /**
+     * 翻一页并取指纹；如果这一下没翻动，换一组参数再试一次。
+     *
+     * 🔴 ColorOS 桌面有时对「中等距离的慢滑」不响应（实测 750px/320ms 原地不动），
+     *    换成更短更快的甩动就正常了。宁可多试一次，也不要直接判定「只有一页」。
+     */
+    /**
+     * 任何一步之后都要确认前台还是桌面。
+     *
+     * 🔴 一旦误触打开了某个应用，后面的 dump 就是那个应用的界面，
+     *    「找文件夹」会在应用界面里乱点，表现就是「扫着扫着打开了 App」。
+     */
+    private boolean stillLauncher(String where) {
+        if (isLauncherFront()) return true;
+        dbg("误入其它应用（" + where + "）→ 回桌面并中止");
+        win().key(3);
+        try { Thread.sleep(900); } catch (InterruptedException ignored) { }
+        return false;
+    }
+
+    private String swipePageSig(boolean toNext, String prevSig) {
+        swipePage(toNext);
+        if (!stillLauncher("翻页")) return "";
+        String cur = pageSignature(dumpStable(5, 2500));
+        if (cur.equals(prevSig)) {
+            dbg("翻页未生效，换参数再试");
+            // 🔴 不能放在 y=2000：那是图标行，甩一下会直接点开应用
+            int x1 = toNext ? 1200 : 60;
+            int x2 = toNext ? 60 : 1200;
+            win().swipe(x1, 1200, x2, 1200, 180);
+            try { Thread.sleep(700); } catch (InterruptedException ignored) { }
+            cur = pageSignature(dumpStable(5, 2500));
+        }
+        return cur;
+    }
+
+    /**
+     * 等一个「渲染完成」的 dump。
+     *
+     * 🔴 无障碍引擎读树是毫秒级，但桌面本身是异步渲染的：HOME 回来、翻页、
+     *    打开文件夹之后，头几百毫秒拿到的树可能只有一两个节点（空壳）。
+     *    以前只看「长度 > 1000 / 至少 1 个 desc」，空壳照样通过，
+     *    结果滑动探测把 3 页的桌面数成 1 页。
+     *
+     * 判据：desc 节点数 ≥ minDescs，且连续两次采样数量一致。
+     */
+    private String dumpStable(int minDescs, int timeoutMs) {
+        long end = System.currentTimeMillis() + timeoutMs;
+        int lastN = -1;
+        String last = "";
+        while (true) {
+            String xml = dumpHome(false);
+            int n = countDescs(xml);
+            if (n >= minDescs && n == lastN) return xml;
+            last = xml;
+            lastN = n;
+            if (System.currentTimeMillis() >= end) return last;
+            try { Thread.sleep(250); } catch (InterruptedException ignored) { }
+        }
     }
 
     /**
@@ -908,7 +1101,7 @@ public class Bridge {
      */
     private int[] sweepScan(String label, int[] pageOut) {
         final int MAX = 10;
-        service.shellLong("input keyevent 3");
+        win().key(3);
         try { Thread.sleep(500); } catch (InterruptedException ignored) { }
         java.util.Set<String> seen = new java.util.HashSet<String>();
         for (int pg = 1; pg <= MAX; pg++) {
@@ -927,7 +1120,7 @@ public class Bridge {
             java.util.List<int[]> folders = findFolders(px);
             for (int i = 0; i < folders.size() && i < 12; i++) {
                 if (userLeft()) return null;
-                service.shellLong("input tap " + folders.get(i)[0] + " " + folders.get(i)[1]);
+                win().tap(folders.get(i)[0], folders.get(i)[1]);
                 try { Thread.sleep(450); } catch (InterruptedException ignored) { }
                 String fx = dumpHome(false);
                 if (fx.isEmpty()) return null;
@@ -938,7 +1131,7 @@ public class Bridge {
                     dbg("滑动扫描命中: " + label + " → 第 " + pg + " 页（文件夹内）");
                     return hit;
                 }
-                service.shellLong("input keyevent 4");
+                win().key(4);
                 try { Thread.sleep(280); } catch (InterruptedException ignored) { }
             }
             if (pg < MAX) swipePage(true);
@@ -956,10 +1149,12 @@ public class Bridge {
 
     /** 翻页：toNext=true 左滑去下一页，false 右滑回上一页。 */
     private void swipePage(boolean toNext) {
-        int fx = toNext ? 950 : 200;
-        int tx = toNext ? 200 : 950;
-        service.shellLong("input swipe " + fx + " 1200 " + tx + " 1200 260");
-        try { Thread.sleep(320); } catch (InterruptedException ignored) { }
+        // 🔴 从 950→200 改成 1150→120：这台机器是 1272×2772，
+        //    原来的 750px 只有屏宽 59%，ColorOS 桌面不认，翻了等于没翻。
+        int fx = toNext ? 1150 : 120;
+        int tx = toNext ? 120 : 1150;
+        win().swipe(fx, 1200, tx, 1200, 320);
+        try { Thread.sleep(650); } catch (InterruptedException ignored) { }
     }
 
     private String dumpHome(boolean needPager) {
@@ -978,8 +1173,7 @@ public class Bridge {
             if (i > 0 && needPager && userLeft()) return "";
             // 用户碰了屏幕就别再等了：一次 dump 2~4 秒，等它跑完用户早就以为没反应
             if (i > 0 && touchHit) return "";
-            service.shellLong("uiautomator dump --compressed /sdcard/mineapp_loc.xml");
-            String xml = service.shellLong("cat /sdcard/mineapp_loc.xml");
+            String xml = win().dump();
             int len = xml == null ? -1 : xml.length();
             boolean hasPage = xml != null && xml.contains("页共");
             dbg("dumpHome 第" + (i + 1) + "次: 长度=" + len + " 有页共=" + hasPage + " needPager=" + needPager);
@@ -990,8 +1184,13 @@ public class Bridge {
             //    那是桌面还没渲染完的半成品。需要页号时必须确认「页共」节点真的在。
             //    不需要页号时（文件夹内 dump）门槛要低：小文件夹只有 2KB 出头，
             //    门槛设 3000 会逼它重试 3 次，整个索引被拖慢一倍。
+            // 🔴 光看长度会把「桌面空壳」当成成功：ColorOS 桌面 HOME 后
+            //    能 dump 到 3.7KB 的树，但里面一个图标节点都没有，
+            //    滑动探测拿到空指纹就直接判定「不支持应用查找」。
+            //    所以这里再要求至少有一个 content-desc 非空的节点。
             boolean ok = xml != null && xml.contains("<hierarchy")
-                    && (needPager ? xml.contains("页共") : len > 1000);
+                    && (needPager ? xml.contains("页共")
+                                  : (len > 1000 && countDescs(xml) > 0));
             if (ok) return xml;
             // 🔴 需要页号却连续拿不到 = 人还在文件夹里（或文件夹编辑态）。
             //    这时前台仍然是桌面，userLeft() 判断不出来，就会白 dump 三次然后
@@ -999,10 +1198,9 @@ public class Bridge {
             //    按一次 HOME 退回桌面根，再给一次机会。
             if (i == 2 && needPager && isLauncherFront()) {
                 dbg("需要页号但拿不到，可能还在文件夹里 → 按 HOME 退回桌面再试");
-                service.shellLong("input keyevent 3");
+                win().key(3);
                 try { Thread.sleep(600); } catch (InterruptedException ignored) { }
-                service.shellLong("uiautomator dump --compressed /sdcard/mineapp_loc.xml");
-                String x2 = service.shellLong("cat /sdcard/mineapp_loc.xml");
+                String x2 = win().dump();
                 if (x2 != null && x2.contains("页共")) {
                     dbg("HOME 后 dump 成功: 长度=" + x2.length());
                     return x2;
@@ -1047,6 +1245,13 @@ public class Bridge {
                     // 用户会觉得「停不下来」，所以给一个上限，到点就收尾并提示。
                     locDeadline = System.currentTimeMillis() + 40000L;
                     if (label.isEmpty()) return o.toString();
+                    // 本轮用哪个引擎：显式选了无障碍但没开服务时直接返回，不偷偷降级
+                    locEngine = pickEngine();
+                    if (locEngine == null) {
+                        o.put("noengine", true);
+                        return o.toString();
+                    }
+                    dbg("定位引擎=" + locEngine.name());
                     // 有缓存页号 = 已知位置，很快就完；没有 = 首次查找，要遍历桌面各页
                     boolean firstScan = wantPage < 1;
                     String baseHint = hint.isEmpty() ? "Looking for app" : hint;
@@ -1063,7 +1268,7 @@ public class Bridge {
                     // 已经在桌面就不用按 HOME：HOME 会把页面拉回默认页（第 1 页），
                     // 紧接着再跳到索引页，视觉上就是「建了索引还从头翻」。
                     if (!isLauncherFront()){
-                        service.shellLong("input keyevent 3");
+                        win().key(3);
                         // 🔴 等桌面真正渲染完再 dump：0.4 秒时 dump 常常拿不到
                         //    「第 N 页共 M 页」节点，parsePager 返回 -1，
                         //    跳页就会退化成盲滑（实测跳到第 3 页而不是第 2 页）。
@@ -1159,7 +1364,7 @@ public class Bridge {
                                         } else if (!idxFolder.equals(f[2])) {
                                             continue;
                                         }
-                                        service.shellLong("input tap " + f[0] + " " + f[1]);
+                                        tapFolder(f, px);
                                         try { Thread.sleep(450); } catch (InterruptedException ignored) { }
                                         String fx = dumpHome(false);
                                         real = findNode(fx, label, false);
@@ -1169,12 +1374,12 @@ public class Bridge {
                                         // （HOME 会跳回默认页，后面再点就点到别的图标上了）
                                         // 关之前先看用户有没有自己点了东西，别把他的应用一起关掉
                                         if (userLeft()) return o.toString();
-                                        service.shellLong("input keyevent 4");
+                                        win().key(4);
                                         try { Thread.sleep(300); } catch (InterruptedException ignored) { }
                                         String bx = dumpHome(false);
                                         if (bx.isEmpty()) return o.toString();   // 用户切走了
                                         if (parsePager(bx)[0] <= 0) {           // 还在文件夹里（编辑态）
-                                            service.shellLong("input keyevent 4");
+                                            win().key(4);
                                             try { Thread.sleep(250); } catch (InterruptedException ignored) { }
                                         }
                                     }
@@ -1186,14 +1391,14 @@ public class Bridge {
                                     for (int i = 0; i < fs.size() && i < 12; i++) {
                                         if (userLeft()) return o.toString();
                                         int[] f = fs.get(i);
-                                        service.shellLong("input tap " + f[0] + " " + f[1]);
+                                        win().tap(f[0], f[1]);
                                         try { Thread.sleep(450); } catch (InterruptedException ignored) { }
                                         real = findNode(dumpHome(false), label, false);
                                         if (real != null) break;
                                         // 🔴 先看用户有没有自己点了东西：他打开的应用不要被我们按 HOME 顶掉，
                                         //    否则「点哪里都打断不了」（实测投诉）。
                                         if (userLeft()) return o.toString();
-                                        service.shellLong("input keyevent 3");
+                                        win().key(3);
                                         try { Thread.sleep(250); } catch (InterruptedException ignored) { }
                                     }
                                 }
@@ -1274,7 +1479,7 @@ public class Bridge {
                             for (int i = 0; i < folders.size() && i < 12; i++) {
                                 if (userLeft()) return o.toString();
                                 int[] f = folders.get(i);
-                                service.shellLong("input tap " + f[0] + " " + f[1]);
+                                win().tap(f[0], f[1]);
                                 try { Thread.sleep(450); } catch (InterruptedException ignored) { }
                                 String fx = dumpHome(false);
                                 if (fx.isEmpty()) return o.toString();
@@ -1282,12 +1487,12 @@ public class Bridge {
                                 if (hit != null) { hitPage = pg; break; }
                                 // 用 BACK 关文件夹：保留当前页，否则后面的页号判断全错
                                 if (userLeft()) return o.toString();
-                                service.shellLong("input keyevent 4");
+                                win().key(4);
                                 try { Thread.sleep(280); } catch (InterruptedException ignored) { }
                                 String bx = dumpHome(false);
                                 if (bx.isEmpty()) return o.toString();
                                 if (parsePager(bx)[0] <= 0) {          // 还在文件夹里（编辑态）
-                                    service.shellLong("input keyevent 4");
+                                    win().key(4);
                                     try { Thread.sleep(250); } catch (InterruptedException ignored) { }
                                 }
                             }
@@ -1356,6 +1561,13 @@ public class Bridge {
                 locStop = false;          // 静态标志：上次定位按过「停止」不能把索引一起带停
                 locDeadline = 0;          // 建索引不看定位的超时判据
                 idxRunning = true;
+                locEngine = pickEngine();
+                dbg("索引引擎=" + (locEngine == null ? "null" : locEngine.name()));
+                if (locEngine == null) {
+                    idxRunning = false;
+                    try { o.put("ok", false); o.put("noengine", true); } catch (Throwable ignored) { }
+                    return o.toString();
+                }
                 try {
                     android.content.SharedPreferences sp =
                             web.getContext().getSharedPreferences("app", 0);
@@ -1380,7 +1592,60 @@ public class Bridge {
                         dbg(rebuild ? "重建索引：清空旧数据" : "索引已过期，从头重建");
                     }
 
-                    service.shellLong("input keyevent 3");
+                    // ---------- root 快路径：直接读桌面数据库 ----------
+                    // root 设备不用一页页扫：launcher.db 的 favorites 表就是权威数据，
+                    // 一次查询拿到「应用 → 第几页 / 哪个文件夹」，几秒建完。
+                    boolean wantDb = "root".equals(enginePref())
+                            || ("auto".equals(enginePref()) && "root".equals(service.mode()));
+                    if (wantDb && "root".equals(service.mode())) {
+                        String[] src = new String[1];
+                        java.util.List<LauncherDb.Entry> rows =
+                                LauncherDb.load(service, web.getContext(), src);
+                        if (rows != null && !rows.isEmpty()) {
+                            JSONObject fast = new JSONObject();
+                            int n = 0;
+                            for (LauncherDb.Entry e : rows) {
+                                if (e.title == null || e.title.isEmpty()) continue;
+                                org.json.JSONArray v = new org.json.JSONArray();
+                                v.put(e.screen + 1);
+                                v.put(e.folder == null ? "" : e.folder);
+                                fast.put(e.title, v);
+                                n++;
+                            }
+                            if (n > 0) {
+                                sp.edit().putString("locIndex", fast.toString())
+                                        .putInt("locIndexPage", 1)
+                                        .putLong("locIndexAt", System.currentTimeMillis()).apply();
+                                dbg("root 快路径：" + src[0] + " → " + n + " 个应用");
+                                idxRunning = false;
+                                stopTouchWatch();
+                                o.put("ok", true);
+                                o.put("done", true);
+                                o.put("count", n);
+                                o.put("added", n);
+                                o.put("source", "db");
+                                backToApp();
+                                return o.toString();
+                            }
+                        }
+                        dbg("桌面库读取失败，回落无障碍扫描");
+                        if ("root".equals(enginePref())) {
+                            idxRunning = false;
+                            stopTouchWatch();
+                            o.put("ok", false);
+                            o.put("dbfail", true);
+                            return o.toString();
+                        }
+                    } else if ("root".equals(enginePref())) {
+                        // 选了 root 但没有 root 权限
+                        idxRunning = false;
+                        stopTouchWatch();
+                        o.put("ok", false);
+                        o.put("noroot", true);
+                        return o.toString();
+                    }
+
+                    win().key(3);
                     try { Thread.sleep(900); } catch (InterruptedException ignored) { }
                     // 用户已经切走了就别再 dump 三次（每次 2.3 秒，白等 7 秒）
                     if (userLeft()) return o.toString();
@@ -1423,25 +1688,30 @@ public class Bridge {
                     if (resumePage > total) resumePage = 1;
 
                     int added = 0, page = resumePage;
-                    // 滑动探测结束时停在最左页，从它开始按差值左滑，不用再按 HOME
-                    int sweepCur = 1;
+                    // 🔴 滑动探测结束时停在哪一页并不可靠（ColorOS 偶尔吞一次滑动）。
+                    //    索引前先一路右滑到指纹不再变化，确保从最左页开始。
+                    if (sweepMode) {
+                        String sig = pageSignature(dumpStable(5, 3000));
+                        for (int i = 0; i < 10 && !sig.isEmpty(); i++) {
+                            String s2 = swipePageSig(false, sig);
+                            if (s2.isEmpty() || s2.equals(sig)) break;
+                            sig = s2;
+                        }
+                        dbg("索引从最左页开始");
+                    }
                     notifyLocate(resumePage > 1
                             ? "从第 " + resumePage + "/" + total + " 页继续索引"
                             : "开始遍历桌面 · 共 " + total + " 页 · 可随时打断", false);
                     for (; page <= total && page <= 8; page++) {
                         if (idxStop || touchHit || !isLauncherFront()) break;
-                        if (sweepMode) {
-                            // 🔴 这里不能用 jumpToPage：它读不到当前页时会按 HOME，
-                            //    而 HOME 回的是「默认页」，不一定是最左页 —— 差值就错了。
-                            while (sweepCur < page) {
-                                if (interrupted()) break;
-                                swipePage(true);
-                                sweepCur++;
-                            }
-                        } else {
+                        // 🔴 滑动模式不按页号差值跳：ColorOS 会吞滑动，
+                        //    差值一错就整轮错位（实测「提示 2/3，屏幕已经在第 3 页」）。
+                        //    改成「索引完当前页 → 验证翻页成功 → 再索引下一页」。
+                        if (!sweepMode) {
                             jumpToPage(pager, page);
                         }
-                        String xml = dumpHome(false);
+                        String xml = dumpStable(5, 3000);
+                        dbg("索引第 " + page + "/" + total + " 页，节点=" + countDescs(xml));
                         added += indexPage(index, xml, page, "");
                         // 该页的文件夹（带名字：定位时能直接打开目标文件夹，不用逐个试）
                         java.util.List<Object[]> folders = findFoldersNamed(xml);
@@ -1457,16 +1727,26 @@ public class Bridge {
                             if (idxStop || touchHit || !isLauncherFront()) break;
                             Object[] f = folders.get(i);
                             String fname = useFolderIndex ? ("#" + i) : (String) f[2];
-                            service.shellLong("input tap " + ((Integer) f[0]) + " " + ((Integer) f[1]));
+                            if (!stillLauncher("开文件夹前")) break;
+                            tapFolder(f, xml);
                             try { Thread.sleep(450); } catch (InterruptedException ignored) { }
-                            added += indexPage(index, dumpHome(false), page, fname);
+                            // 点下去如果打开的是应用而不是文件夹，立刻停下回桌面
+                            if (!isLauncherFront()) {
+                                dbg("打开的不是文件夹（是应用）→ 回桌面，本页停止");
+                                win().key(3);
+                                try { Thread.sleep(900); } catch (InterruptedException ignored) { }
+                                break;
+                            }
+                            String fx = dumpStable(1, 2000);
+                            dbg("文件夹 " + fname + " → " + countDescs(fx) + " 个图标");
+                            added += indexPage(index, fx, page, fname);
                             // 🔴 用 BACK 关文件夹，不要用 HOME。
                             //    HOME 一定会跳回桌面**第 1 页**（实测「第 1 页共 3 页」），
                             //    之后为了接着索引当前页的文件夹，又得从第 1 页滑回来 ——
                             //    用户看到的就是「打开文件夹 → 滑回去 → 左滑两下 → 再打开」
                             //    每处理一个文件夹折腾一遍（实测被投诉）。
                             //    BACK 只是关掉文件夹，页面停在原处，一下都不用滑。
-                            service.shellLong("input keyevent 4");
+                            win().key(4);
                             try { Thread.sleep(300); } catch (InterruptedException ignored) { }
                         }
                         // 每页文件夹处理完，确认还停在本页（BACK 万一没关掉文件夹、或用户手动滑过）。
@@ -1481,6 +1761,16 @@ public class Bridge {
                                     dbg("索引：页号偏了(" + nowP[0] + "→" + page + ")，纠正");
                                     jumpToPage(pager, page);
                                 }
+                            }
+                        }
+                        // 滑动模式：翻到下一页并确认真的翻动了；翻不动就收尾，
+                        // 绝不带着错误的位置继续扫（否则会把同一页记成两页）。
+                        if (sweepMode && page < total) {
+                            String curSig = pageSignature(xml);
+                            String nextSig = swipePageSig(true, curSig);
+                            if (nextSig.isEmpty() || nextSig.equals(curSig)) {
+                                dbg("翻页失败（第 " + page + " → " + (page + 1) + "），提前结束");
+                                break;
                             }
                         }
                         // 每页存一次盘，随时中断都不丢
@@ -1534,7 +1824,7 @@ public class Bridge {
      *
      * 已存在的条目**不覆盖**：桌面层级的记录先写入，比文件夹内的更可信。
      */
-    private int indexPage(JSONObject index, String xml, int page, String folder) {
+    private static int indexPage(JSONObject index, String xml, int page, String folder) {
         int n = 0;
         java.util.regex.Matcher m = java.util.regex.Pattern
                 .compile("<node\\b[^>]*>").matcher(xml);
@@ -1573,14 +1863,26 @@ public class Bridge {
      */
     private boolean jumpToPageBySwipe(int page) {
         if (page < 1) return false;
-        service.shellLong("input keyevent 3");
-        try { Thread.sleep(500); } catch (InterruptedException ignored) { }
+        win().key(3);
+        try { Thread.sleep(900); } catch (InterruptedException ignored) { }
+        // 🔴 HOME 回的是「默认页」，不一定是最左页；先一路右滑到指纹不再变化。
+        String sig = pageSignature(dumpStable(5, 3000));
+        for (int i = 0; i < 10 && !sig.isEmpty(); i++) {
+            String s2 = swipePageSig(false, sig);
+            if (s2.isEmpty() || s2.equals(sig)) break;
+            sig = s2;
+        }
         for (int i = 1; i < page; i++) {
             if (interrupted()) {
                 dbg("滑动跳页被打断");
                 return false;
             }
-            swipePage(true);
+            String s3 = swipePageSig(true, sig);
+            if (s3.isEmpty() || s3.equals(sig)) {
+                dbg("滑动跳页失败：第 " + i + " 页没翻动");
+                return false;
+            }
+            sig = s3;
         }
         return true;
     }
@@ -1594,7 +1896,7 @@ public class Bridge {
             String[] arr = dots.split(";");
             if (page < 1 || page > arr.length) return false;
             String[] xy = arr[page - 1].split(",");
-            service.shellLong("input tap " + xy[0] + " " + xy[1]);
+            win().tap(Integer.parseInt(xy[0]), Integer.parseInt(xy[1]));
             try { Thread.sleep(350); } catch (InterruptedException ignored) { }
             return true;
         } catch (Throwable e) {
@@ -2337,6 +2639,70 @@ public class Bridge {
      * 参数是端口号字符串。越界（<1024 或 >65535）直接拒绝 —— 1024 以下要 root，
      * adb tcpip 本身也会失败，放过去只会让用户以为设置成功了却连不上。
      */
+    /** 应用查找引擎状态：用户选择 / 无障碍是否就绪 / 实际生效的引擎 */
+    @JavascriptInterface
+    public void engine(int id, String arg) {
+        dispatch(id, new Task() {
+            @Override public String run() { return engineJson(); }
+        });
+    }
+
+    /** 设置查找引擎：auto / access / dump */
+    @JavascriptInterface
+    public void setengine(int id, final String arg) {
+        dispatch(id, new Task() {
+            @Override public String run() {
+                String v = arg == null ? "" : arg.trim();
+                if (!"access".equals(v) && !"dump".equals(v) && !"root".equals(v)) v = "auto";
+                prefs().edit().putString(ENGINE_PREF, v).apply();
+                return engineJson();
+            }
+        });
+    }
+
+    /** 去系统的无障碍设置页把本应用的服务打开 */
+    @JavascriptInterface
+    public void openaccess(int id, String arg) {
+        dispatch(id, new Task() {
+            @Override public String run() {
+                try {
+                    android.content.Intent i = new android.content.Intent(
+                            android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS);
+                    i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                    web.getContext().startActivity(i);
+                    return "{\"ok\":true}";
+                } catch (Throwable e) {
+                    return "{\"ok\":false}";
+                }
+            }
+        });
+    }
+
+    private String engineJson() {
+        JSONObject o = new JSONObject();
+        try {
+            String pref = enginePref();
+            boolean has = AccessEngine.ready();
+            boolean rootOk = "root".equals(service.mode());
+            String eff;
+            if ("access".equals(pref)) eff = has ? "access" : "none";
+            else if ("dump".equals(pref)) eff = "dump";
+            else if ("root".equals(pref)) eff = rootOk ? "root" : "none";
+            else eff = rootOk ? "root" : (has ? "access" : "dump");
+            o.put("pref", pref);
+            o.put("access", has);
+            o.put("root", rootOk);
+            o.put("effective", eff);
+        } catch (Throwable e) {
+            try {
+                o.put("pref", "auto");
+                o.put("access", false);
+                o.put("effective", "dump");
+            } catch (Exception ignored) { }
+        }
+        return o.toString();
+    }
+
     @JavascriptInterface
     public void setport(int id, String arg) {
         final int p = parseIntSafe(arg == null ? "" : arg.trim(), -1);

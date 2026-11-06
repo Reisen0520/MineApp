@@ -526,6 +526,15 @@ padding-top:10px;border-top:0.5px solid var(--line)}
       <button class="edit" id="idxBtn" data-t="idxStart" style="padding:0 14px;flex:none">开始</button>
     </div>
     <div class="idx-note" data-t="idxNote" data-html="1" style="margin:4px 0 0">遍历桌面所有页和文件夹，建立应用位置索引。过程中可以随时操作手机打断，下次点「开始」会接着来。应用较多时约需数分钟，完成后查找会快很多。</div>
+    <div class="setrow" style="gap:8px;margin:10px 0 0">
+      <span class="setrow-lb" data-t="engTitle">查找引擎</span>
+      <div class="sortbar" id="engineBar">
+        <button class="seg" data-eng="auto" data-t="engAuto">自动</button>
+        <button class="seg" data-eng="access" data-t="engAccess">无障碍</button>
+        <button class="seg" data-eng="root" data-t="engRoot">Root</button>
+      </div>
+    </div>
+    <div class="idx-note" id="engineNote" style="margin:4px 0 0"></div>
 
     <div class="setrow" style="gap:8px;margin:8px 0 2px">
       <span class="setrow-lb" id="updLabel" data-ver="__APP_VERSION__">v —</span>
@@ -762,6 +771,13 @@ var I18N = {
     locSlowTip: '没有可用索引，正在逐页查找，可能要几十秒。建议先到设置页「初始化应用查找功能」',
     locWaitRefresh: '正在刷新列表，完成后自动定位',
     idxNote: '遍历桌面所有页和文件夹，建立应用位置索引。过程中可以随时操作手机打断，下次点「开始」会接着来。应用较多时约需数分钟，完成后查找会快很多。 <b id="idxAt" style="color:var(--ink2);font-weight:600"></b>',
+    engTitle: '查找引擎', engAuto: '自动', engAccess: '无障碍', engDump: '兼容',
+    engRoot: 'Root',
+    engOnAccess: '无障碍引擎：读一次桌面约 50ms，不需要调试通道，重启后也能用。',
+    engOnRoot: 'Root 引擎：直接读桌面数据库，几秒建好索引；不需要逐页扫描。',
+    engNeedRoot: '当前没有 root 权限，这个模式用不了；可以改用「无障碍」。',
+    engOnDump: '兼容引擎：走 uiautomator dump，每次约 2~3 秒。',
+    engNeedOn: '无障碍服务还没开启，点这里去系统设置里打开「应用查找」。',
     idxAgeMin: '上次完成：{n} 分钟前', idxAgeHour: '上次完成：{n} 小时前', idxAgeDay: '上次完成：{n} 天前',
     idxDone: '索引完成，共 {n} 个应用', idxPaused: '已暂停，下次点「开始」接着来', idxFail: '索引构建失败，建议反馈 issue（附机型与桌面信息），以便持续更新',
     perfPausedTitle: '系统频繁关闭性能模式',
@@ -909,6 +925,13 @@ var I18N = {
     locSlowTip: 'No usable index — walking every page, this may take tens of seconds. Build the index in Settings for faster lookups.',
     locWaitRefresh: 'Refreshing the list — locating right after',
     idxNote: 'Walks every home-screen page and folder to index where each app lives. You can interrupt it any time by using the phone — tapping Start again resumes. Takes a few minutes on a full phone, and makes later lookups much faster. <b id="idxAt" style="color:var(--ink2);font-weight:600"></b>',
+    engTitle: 'Finder engine', engAuto: 'Auto', engAccess: 'Accessibility', engDump: 'Compat',
+    engRoot: 'Root',
+    engOnAccess: 'Accessibility engine: ~50 ms per read, no ADB channel needed, survives reboot.',
+    engOnRoot: 'Root engine: reads the launcher database directly, index in seconds.',
+    engNeedRoot: 'No root access — this mode needs root. Use Accessibility instead.',
+    engOnDump: 'Compat engine: uiautomator dump, ~2-3 s per read.',
+    engNeedOn: 'Accessibility service is off - tap here to enable "应用查找" in system settings.',
     idxAgeMin: 'Last built {n} min ago', idxAgeHour: 'Last built {n} h ago', idxAgeDay: 'Last built {n} days ago',
     idxDone: 'Index complete — {n} apps', idxPaused: 'Paused — tap Start to resume', idxFail: 'Failed to build the index — please open an issue with your device and launcher',
     perfPausedTitle: 'The system keeps turning performance mode off',
@@ -1107,9 +1130,67 @@ function relang(){
   updateStat();
 }
 
+/* ---------- 查找引擎（无障碍 / 兼容 dump） ----------
+   两种引擎共存，用户自己选：开着无障碍就走进程内读树（快、不依赖调试通道），
+   没开或不想开就退回 uiautomator dump（慢但永远可用）。 */
+var engState = {pref: 'auto', access: false, root: false, effective: 'dump'};
+
+function renderEngine(d){
+  if (d && d.pref) engState = d;
+  var bar = document.getElementById('engineBar');
+  if (bar){
+    var segs = bar.querySelectorAll('.seg');
+    for (var i = 0; i < segs.length; i++){
+      segs[i].classList.toggle('on', segs[i].getAttribute('data-eng') === engState.pref);
+    }
+  }
+  var n = document.getElementById('engineNote');
+  if (!n) return;
+  if (engState.pref === 'root' && !engState.root){
+    n.textContent = T('engNeedRoot');
+    n.style.cursor = '';
+    n.onclick = null;
+  } else if (engState.effective === 'root'){
+    n.textContent = T('engOnRoot');
+    n.style.cursor = '';
+    n.onclick = null;
+  } else if (engState.pref === 'access' && !engState.access){
+    n.textContent = T('engNeedOn');
+    n.style.cursor = 'pointer';
+    n.onclick = function(){ fetch('/api/openaccess', {method:'POST'}); };
+  } else {
+    n.style.cursor = '';
+    n.onclick = null;
+    n.textContent = (engState.effective === 'access') ? T('engOnAccess') : T('engOnDump');
+  }
+}
+
+function loadEngine(){
+  fetch('/api/engine').then(function(r){ return r.json(); })
+    .then(renderEngine).catch(function(){});
+}
+
+function setEngine(mode){
+  fetch('/api/setengine', {method:'POST', headers:{'Content-Type':'application/json'},
+                           body: JSON.stringify({mode: mode})})
+    .then(function(r){ return r.json(); }).then(renderEngine).catch(function(){});
+}
+
+(function bindEngineBar(){
+  var bar = document.getElementById('engineBar');
+  if (!bar) return;
+  bar.addEventListener('click', function(e){
+    var b = e.target;
+    while (b && b !== bar && !b.getAttribute('data-eng')) b = b.parentNode;
+    if (!b || b === bar) return;
+    setEngine(b.getAttribute('data-eng'));
+  });
+})();
+
 function openSettings(){
   updateIdxAt();                // 先用缓存值填上，别等列表刷新
   renderSettings();
+  loadEngine();
   document.getElementById('settings').classList.add('show');
 }
 
@@ -2052,6 +2133,11 @@ function doLocate(pkg, label, force, c, now){
     .then(function(r){ return r.json(); })
     .then(function(d){
       if (slowTip) clearTimeout(slowTip);
+      if (d && d.noengine){
+        toast(T('engNeedOn'));
+        try { delete locCache[pkg]; localStorage.setItem('locCache', JSON.stringify(locCache)); } catch (e) {}
+        return;
+      }
       if (d && d.found){
         locCache[pkg] = {page: d.page, t: Date.now()};
         try { localStorage.setItem('locCache', JSON.stringify(locCache)); } catch (e) {}
@@ -2276,6 +2362,9 @@ document.getElementById('idxBtn').onclick = function(){
         }, 1200);
         return;
       }
+      if (d && d.noengine){ toast(T('engNeedOn')); return; }
+      if (d && d.noroot){ toast(T('engNeedRoot')); return; }
+      if (d && d.dbfail){ toast(T('tFail').replace('{m}', 'launcher.db')); return; }
       if (!d || !d.ok){ toast(T('idxFail')); return; }
       if (d.done) markIdxDone();
       toast(d.done ? T2('idxDone', {n: d.count}) : T('idxPaused'));

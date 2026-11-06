@@ -73,6 +73,20 @@ TAIL = '''
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="显示电池与应用状态并保持用户选择的性能模式" />
         </service>
+
+        <!-- 应用查找：可选的无障碍引擎。用户不开就不生效，开了才读桌面节点树 -->
+        <service
+            android:name=".AccessEngine"
+            android:exported="true"
+            android:label="@string/access_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service" />
+        </service>
     </application>
 </manifest>
 '''
