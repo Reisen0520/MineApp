@@ -131,6 +131,56 @@ public class AdbService {
     private AdbClient conn;
     private final Object lock = new Object();
 
+    // ---------- root 通道 ----------
+    //
+    // 有 root 时优先走 su：不需要 adb tcpip、不需要授权弹窗，重启后照常可用。
+    // 没有 root（或用户拒绝了授权）时自动回落原本的 ADB 自连接，行为完全不变。
+    //
+    // 探测失败后每 30 秒才重试 —— 用户在 Magisk 里点完「允许」不用重启 App，
+    // 下一次刷新就会切到 root。
+
+    private RootShell rootShell;
+    private RootShell rootLongShell;
+    private final Object rootLock = new Object();
+    private boolean rootChecked;
+    private boolean rootOk;
+    private long rootLastProbe;
+    private static final int ROOT_PROBE_TIMEOUT_MS = 20000;
+    private static final long ROOT_RETRY_MS = 30000;
+
+    /** root 通道是否可用；必要时拉起 su（首次会弹一次 Magisk 授权框）。 */
+    private boolean rootAvailable() {
+        synchronized (rootLock) {
+            if (rootOk && rootShell != null && rootShell.isAlive()) return true;
+            long now = System.currentTimeMillis();
+            if (rootChecked && !rootOk && now - rootLastProbe < ROOT_RETRY_MS) return false;
+            rootChecked = true;
+            rootLastProbe = now;
+            if (rootShell != null) rootShell.close();
+            RootShell s = new RootShell();
+            rootOk = s.start(ROOT_PROBE_TIMEOUT_MS);
+            if (rootOk) {
+                rootShell = s;
+                Log.i(TAG, "root 通道已就绪");
+            } else {
+                s.close();
+                rootShell = null;
+                Log.i(TAG, "未取得 root，回落 ADB");
+            }
+            return rootOk;
+        }
+    }
+
+    /** 当前传输方式：root / adb（给界面显示用）。 */
+    public String mode() {
+        return rootAvailable() ? "root" : "adb";
+    }
+
+    private String execRoot(RootShell s, String cmd, int timeoutMs) throws Exception {
+        if (s == null || !s.isAlive()) throw new IOException("root shell 未就绪");
+        return s.run(cmd, timeoutMs);
+    }
+
     private AdbClient conn() throws Exception {
         if (conn != null && conn.isConnected()) return conn;
         if (conn != null) { conn.close(); conn = null; }
@@ -230,6 +280,10 @@ public class AdbService {
      * 表现为「刷新几次之后运存数据取不到」。
      */
     private String exec(String cmd, int timeoutMs, boolean raw) throws Exception {
+        // 有 root 就走 su，后面的 ADB 逻辑不再参与
+        if (rootAvailable()) {
+            return execRoot(rootShell, cmd, timeoutMs);
+        }
         AdbClient c = conn();
         String out = c.shell(cmd, timeoutMs, raw);
         int nl = out.indexOf('\n');
@@ -262,6 +316,18 @@ public class AdbService {
     }
 
     private String shLong(String cmd) throws Exception {
+        // 长任务也走独立的 root shell：AOT 编译跑十分钟时，
+        // 普通命令（刷新、拿内存）不能被它堵住。
+        if (rootAvailable()) {
+            synchronized (rootLock) {
+                if (rootLongShell == null || !rootLongShell.isAlive()) {
+                    RootShell s = new RootShell();
+                    if (s.start(ROOT_PROBE_TIMEOUT_MS)) rootLongShell = s;
+                    else s.close();
+                }
+                if (rootLongShell != null) return execRoot(rootLongShell, cmd, 0);
+            }
+        }
         synchronized (longLock) {
             if (longConn == null || !longConn.isConnected()) {
                 if (longConn != null) {
@@ -284,6 +350,8 @@ public class AdbService {
 
     /** 对应早期 Python 服务端的 adb_state：返回 ok / unauthorized / disconnected。 */
     public String state() {
+        // root 通道可用时不存在「未授权/未连接」这回事
+        if (rootAvailable()) return "ok";
         synchronized (lock) {
             try {
                 conn();
@@ -1384,6 +1452,7 @@ public class AdbService {
             out.put("adb_state", "ok");
             out.put("adb_msg", "");
             out.put("adb_port", port);
+            out.put("mode", mode());
             out.put("idx_at", locIndexAt);
             out.put("idx_partial", locIndexPage > 1);
             out.put("perf", getPerfMode());
